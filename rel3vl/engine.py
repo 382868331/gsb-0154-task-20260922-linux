@@ -22,7 +22,10 @@
 
 from __future__ import annotations
 
-from .errors import PlanError, SchemaError, TableError
+from collections import Counter
+
+from .aggregates import AGG_FUNCS, FUNC_NEEDS_EXPR, compute_aggs, validate_measure
+from .errors import ExpressionError, PlanError, SchemaError, TableError
 from .expressions import compile_expr
 from .values import distinct_key, validate_scalar
 
@@ -37,6 +40,8 @@ _CHILD_KEYS = {
     "left_join": ("left", "right"),
     "union_all": ("left", "right"),
     "distinct": ("input",),
+    "group_by": ("input",),
+    "window": ("input",),
 }
 _REQUIRED_KEYS = {
     "scan": ("table",),
@@ -46,6 +51,8 @@ _REQUIRED_KEYS = {
     "left_join": ("left", "right", "on"),
     "union_all": ("left", "right"),
     "distinct": ("input",),
+    "group_by": ("input", "aggs"),
+    "window": ("input", "time", "width", "aggs"),
 }
 _ALLOWED_NODE_KEYS = {
     "scan": {"op", "id", "table", "as"},
@@ -55,16 +62,19 @@ _ALLOWED_NODE_KEYS = {
     "left_join": {"op", "id", "left", "right", "on"},
     "union_all": {"op", "id", "left", "right"},
     "distinct": {"op", "id", "input"},
+    "group_by": {"op", "id", "input", "keys", "aggs"},
+    "window": {"op", "id", "input", "time", "width", "keys", "aggs"},
 }
 
 
 # ---------------------------------------------------------------- 输入表校验
 
-def validate_tables(tables):
+def validate_tables(tables, *, limit=MAX_ROWS_PER_TABLE):
     """校验 ``tables`` 映射并返回规范化副本 ``{name: (columns, rows)}``。
 
     表：``{"columns": ["a", ...], "rows": [[...], ...]}``。
-    行宽必须一致；列名是非空 str 且表内唯一；行数 ≤ 200；
+    行宽必须一致；列名是非空 str 且表内唯一；行数 ≤ ``limit``
+    （批量入口默认 200，增量入口传更大的上限）；
     每个标量经 :func:`rel3vl.values.validate_scalar` 校验。
     """
     if not isinstance(tables, dict):
@@ -93,9 +103,9 @@ def validate_tables(tables):
             seen.add(c)
         if not isinstance(rows, list):
             raise TableError(f"{prefix}: rows 必须是 list")
-        if len(rows) > MAX_ROWS_PER_TABLE:
+        if len(rows) > limit:
             raise TableError(
-                f"{prefix}: 行数 {len(rows)} 超过上限 {MAX_ROWS_PER_TABLE}"
+                f"{prefix}: 行数 {len(rows)} 超过上限 {limit}"
             )
         norm_rows = []
         for ri, row in enumerate(rows):
@@ -118,13 +128,18 @@ def validate_tables(tables):
 # ---------------------------------------------------------------- 计划编译
 
 class _Compiled:
-    __slots__ = ("label", "schema", "run")
+    __slots__ = ("label", "schema", "run", "num", "op", "children", "detail")
 
-    def __init__(self, label, schema, run):
+    def __init__(self, label, schema, run, *, num=-1, op="", children=(), detail=None):
         # schema: tuple[(source_id, column_name)]；run: () -> list[tuple]
         self.label = label
         self.schema = schema
         self.run = run
+        # 以下元数据供增量解释器（rel3vl.stream）复用同一套编译产物：
+        self.num = num            # 深度优先节点序号
+        self.op = op              # 原始 op 名
+        self.children = tuple(children)  # 子节点 _Compiled
+        self.detail = detail or {}      # op 相关编译细节（谓词闭包等）
 
 
 def _col_index(schema):
@@ -202,8 +217,15 @@ def compile_plan(plan, tables):
             comp = _compile_join(node, num, children[0], children[1], op == "left_join")
         elif op == "union_all":
             comp = _compile_union(node, num, children[0], children[1])
+        elif op == "group_by":
+            comp = _compile_group_by(node, num, children[0])
+        elif op == "window":
+            comp = _compile_window(node, num, children[0])
         else:  # distinct
             comp = _compile_distinct(node, num, children[0])
+        comp.num = num
+        comp.op = op
+        comp.children = tuple(children)
         compiled_by_num[num] = comp
         return num
 
@@ -229,7 +251,9 @@ def _compile_scan(node, num, tables):
     def run():
         return [tuple(r) for r in snapshot]
 
-    return _Compiled(f"[node#{num}](scan:{tname})", schema, run)
+    return _Compiled(f"[node#{num}](scan:{tname})", schema, run,
+                     detail={"table": tname, "source": source,
+                             "columns": columns})
 
 
 def _compile_filter(node, num, child):
@@ -245,7 +269,8 @@ def _compile_filter(node, num, child):
                 out.append(row)
         return out
 
-    return _Compiled(child.label + "|filter", child.schema, run)
+    return _Compiled(child.label + "|filter", child.schema, run,
+                     detail={"pred": pred})
 
 
 def _compile_project(node, num, child):
@@ -286,7 +311,8 @@ def _compile_project(node, num, child):
             out.append(tuple(f(row) for f in compiled_cols))
         return out
 
-    return _Compiled(child.label + "|project", tuple(out_schema), run)
+    return _Compiled(child.label + "|project", tuple(out_schema), run,
+                     detail={"proj_funcs": compiled_cols})
 
 
 def _compile_join(node, num, left, right, outer):
@@ -320,7 +346,9 @@ def _compile_join(node, num, left, right, outer):
                 out.append(lrow + nulls)
         return out
 
-    return _Compiled(f"({left.label}) {tag} ({right.label})", schema, run)
+    return _Compiled(f"({left.label}) {tag} ({right.label})", schema, run,
+                     detail={"pred": pred, "outer": outer, "nulls": nulls,
+                             "n_left": len(left.schema), "n_right": n_right})
 
 
 def _compile_union(node, num, left, right):
@@ -357,17 +385,177 @@ def _compile_distinct(node, num, child):
     return _Compiled(child.label + "|distinct", schema, run)
 
 
+# ------------------------------------------------------------ group_by / window
+
+def _sort_tag(v):
+    """跨类型可排序标签：仅用于聚合结果的确定输出顺序。"""
+    if v is None:
+        return (0, 0)
+    if isinstance(v, bool):
+        return (1, int(v))
+    if isinstance(v, (int, float)):
+        return (2, v)
+    return (3, v)
+
+
+def _compile_agg_specs(node, num, input_schema):
+    """编译 group_by/window 共用的 keys 与 aggs 规格。
+
+    返回 dict：
+      key_funcs  : list[row -> value]
+      key_schema : list[(source, name)]（source 固定 ""）
+      measure_funcs : list[row -> int|None]（需要表达式的聚合的输入）
+      spec_funcs : list[(name, func, measure_index|None)]
+      out_schema : keys 输出列 + 聚合输出列（window 另加窗口列）
+    """
+    where = f"[node#{num}]"
+    idx = _col_index(input_schema)
+    keys = node.get("keys", [])
+    if not isinstance(keys, list):
+        raise PlanError(f"{where}(group_by): 'keys' 必须是 list（可为空列表）")
+    key_funcs, key_schema, seen_names = [], [], set()
+    for i, spec in enumerate(keys):
+        if not isinstance(spec, dict) or set(spec) - {"name", "expr", "table"}:
+            raise PlanError(f"{where} keys#{i}: 必须是含 name/expr 的 dict")
+        name = spec.get("name")
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"{where} keys#{i}: 'name' 必须是非空字符串")
+        if name in seen_names:
+            raise SchemaError(f"{where}: 分组键列名重复：{name!r}")
+        seen_names.add(name)
+        f = compile_expr(spec["expr"], idx, f"{where} keys[{name!r}]/expr")
+        key_funcs.append(f)
+        key_schema.append((spec.get("table", ""), name))
+
+    aggs = node.get("aggs")
+    if not isinstance(aggs, list) or not aggs:
+        raise PlanError(f"{where}: 'aggs' 必须是非空 list")
+    measure_funcs, measure_src, spec_funcs, agg_schema = [], [], [], []
+    for i, spec in enumerate(aggs):
+        if not isinstance(spec, dict) or set(spec) - {"name", "func", "expr", "table"}:
+            raise PlanError(f"{where} aggs#{i}: 必须是含 name/func 的 dict")
+        name = spec.get("name")
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"{where} aggs#{i}: 'name' 必须是非空字符串")
+        if name in seen_names:
+            raise SchemaError(f"{where}: 聚合输出列名与已有列重复：{name!r}")
+        seen_names.add(name)
+        func = spec.get("func")
+        if func not in AGG_FUNCS:
+            raise PlanError(
+                f"{where} aggs#{i}: 未知聚合函数 {func!r}（允许 {AGG_FUNCS}）"
+            )
+        if func in FUNC_NEEDS_EXPR:
+            if "expr" not in spec:
+                raise PlanError(f"{where} aggs#{i}({func}): 缺少 'expr'")
+            raw_f = compile_expr(spec["expr"], idx, f"{where} aggs[{name!r}]/expr")
+            mwhere = f"{where} aggs[{name!r}]({func})"
+
+            def f(row, _raw=raw_f, _w=mwhere):
+                return validate_measure(_raw(row), _w)
+
+            measure_funcs.append(f)
+            spec_funcs.append((name, func, len(measure_funcs) - 1))
+        else:  # count_star 不接受 expr
+            if "expr" in spec:
+                raise PlanError(f"{where} aggs#{i}(count_star): 不接受 'expr' 字段")
+            spec_funcs.append((name, "count_star", None))
+        agg_schema.append((spec.get("table", ""), name))
+
+    return {
+        "key_funcs": key_funcs,
+        "key_schema": key_schema,
+        "measure_funcs": measure_funcs,
+        "spec_funcs": spec_funcs,
+        "out_schema": tuple(key_schema) + tuple(agg_schema),
+    }
+
+
+def _measure_row(row, funcs):
+    return tuple(f(row) for f in funcs)
+
+
+def _compile_group_by(node, num, child):
+    spec = _compile_agg_specs(node, num, child.schema)
+    schema = spec["out_schema"]
+
+    def run():
+        groups = {}  # key_tuple -> Counter[measure_tuple]
+        for row in child.run():
+            k = tuple(f(row) for f in spec["key_funcs"])
+            m = _measure_row(row, spec["measure_funcs"])
+            groups.setdefault(k, Counter())[m] += 1
+        out = []
+        for k in sorted(groups, key=lambda t: tuple(_sort_tag(v) for v in t)):
+            vals = compute_aggs(groups[k], spec["spec_funcs"])
+            out.append(k + vals)
+        return out
+
+    return _Compiled(child.label + "|group_by", schema, run,
+                     detail={"group_spec": spec})
+
+
+def _validate_event_time(v, where):
+    """窗口事件时间：非 NULL、非 bool 的整数（逻辑时钟）。"""
+    if isinstance(v, bool) or not isinstance(v, int) or v is None:
+        raise ExpressionError(
+            f"{where}: 事件时间表达式必须求出整数（逻辑时钟），"
+            f"得到 {type(v).__name__}={v!r}"
+        )
+    return v
+
+
+def _compile_window(node, num, child):
+    where = f"[node#{num}](window)"
+    width = node.get("width")
+    if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+        raise PlanError(f"{where}: 'width' 必须是正整数（逻辑时间单位）")
+    idx = _col_index(child.schema)
+    time_f = compile_expr(node["time"], idx, f"{where}/time")
+    spec = _compile_agg_specs(node, num, child.schema)
+    # 输出列：分组键 + window_start/window_end + 聚合。
+    schema = (
+        tuple(spec["key_schema"])
+        + (("", "window_start"), ("", "window_end"))
+        + tuple(c for c in spec["out_schema"][len(spec["key_schema"]):])
+    )
+    nkeys = len(spec["key_schema"])
+    agg_offset = nkeys + 2
+
+    def run():
+        buckets = {}  # (start, key) -> Counter[measure]
+        for row in child.run():
+            t = _validate_event_time(time_f(row), where)
+            start = (t // width) * width
+            k = tuple(f(row) for f in spec["key_funcs"])
+            m = _measure_row(row, spec["measure_funcs"])
+            buckets.setdefault((start, k), Counter())[m] += 1
+        out = []
+        for bk in sorted(buckets, key=lambda bk: (bk[0], tuple(_sort_tag(v) for v in bk[1]))):
+            start, k = bk
+            vals = compute_aggs(buckets[bk], spec["spec_funcs"])
+            out.append(k + (start, start + width) + vals)
+        return out
+
+    detail = {"group_spec": spec, "time_f": time_f, "width": width,
+              "nkeys": nkeys, "agg_offset": agg_offset}
+    return _Compiled(child.label + f"|window(w={width})", schema, run,
+                     detail=detail)
+
+
 # ---------------------------------------------------------------- 公开入口
 
-def execute(plan, tables):
+def execute(plan, tables, *, max_rows=MAX_ROWS_PER_TABLE):
     """执行查询计划。
 
     :param plan: 计划节点 dict 树（见模块文档）。
     :param tables: ``{表名: {"columns": [...], "rows": [[...], ...]}}``。
+    :param max_rows: 每张表的行数上限，默认 :data:`MAX_ROWS_PER_TABLE` (200)。
+        增量对照等内部场景可显式传更大的值；旧调用不传参时行为完全不变。
     :returns: ``{"columns": [{"source", "name"}], "rows": [[...], ...]}``。
     :raises QueryError: 所有非法输入的基类，子类见 :mod:`rel3vl.errors`。
     """
-    norm_tables = validate_tables(tables)
+    norm_tables = validate_tables(tables, limit=max_rows)
     root = compile_plan(plan, norm_tables)
     rows = root.run()
     return {

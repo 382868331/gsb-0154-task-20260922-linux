@@ -30,3 +30,37 @@ class SchemaError(QueryError):
 
 class ExpressionError(QueryError):
     """表达式结构非法或类型不被支持。"""
+
+
+class StreamError(QueryError):
+    """增量（增删流 / 水位 / 窗口）入口的非法输入基类。
+
+    所有 ``StreamError`` 都在批次提交*之前*抛出：整批被拒绝，
+    引擎状态与拒绝前完全一致（原子批次）。
+    """
+
+
+class ChangeError(StreamError):
+    """增删流记录非法：未知表/列、重复 ID、删除不存在的行、op 非法等。"""
+
+
+class WatermarkError(StreamError):
+    """水位非法推进（倒退、非整数逻辑时间等）。"""
+
+
+class LateDataError(StreamError):
+    """事件时间早于 ``水位 - 迟到阈值``（超过保留期限）。
+
+    属性 ``reason`` 区分成因：
+
+    * ``"beyond_retention"`` —— 超过保留期限（窗口可能已清除）；
+    * ``"missing_timestamp"`` —— 窗口时间表达式求出 NULL/非整数。
+    """
+
+    def __init__(self, message, reason="beyond_retention"):
+        super().__init__(message)
+        self.reason = reason
+
+
+class SnapshotError(StreamError):
+    """快照结构/版本非法或与当前计划不兼容。"""
