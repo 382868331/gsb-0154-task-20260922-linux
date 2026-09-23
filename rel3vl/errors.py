@@ -30,3 +30,12 @@ class SchemaError(QueryError):
 
 class ExpressionError(QueryError):
     """表达式结构非法或类型不被支持。"""
+
+
+class StreamError(QueryError):
+    """增量（增删流）输入非法：未知/重复行 ID、水位倒退、事件迟到超过
+    保留期限、批次结构非法等。
+
+    增量解释器在整批校验/试算通过前不提交任何状态，因此抛出本错误时
+    处理器状态与批次开始前完全一致（原子批）。
+    """

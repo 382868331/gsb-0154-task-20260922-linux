@@ -249,7 +249,73 @@ def _nrun(node, tabs):
                 seen.add(key)
                 out[tuple(tup)] = 1
         return schema, out
+    if op == "aggregate":
+        schema, bag = _nrun(node["input"], tabs)
+        nschema = []
+        gspecs = node.get("groups") or []
+        gidx = []
+        for spec in gspecs:
+            gidx.append(_nexpr_index(spec["expr"], schema))
+            nschema.append((spec.get("table", ""), spec["name"]))
+        aspecs = node["aggs"]
+        aidx = []
+        for spec in aspecs:
+            aidx.append((spec["func"],
+                         _nexpr_index(spec["arg"], schema) if "arg" in spec else None))
+            nschema.append((spec.get("table", ""), spec["name"]))
+        groups = {}
+        order = []
+        for tup in bag.elements():
+            gk = tuple(tup[i] for i in gidx)
+            if gk not in groups:
+                groups[gk] = []
+                order.append(gk)
+            groups[gk].append(tup)
+        out = Counter()
+        if not gspecs:
+            groups = {(): list(bag.elements())}
+            order = [()]
+        for gk in order:
+            rows = groups[gk]
+            vals = list(gk)
+            for func, ai in aidx:
+                if func == "count":
+                    vals.append(sum(1 for r in rows if ai is None or r[ai] is not None))
+                else:
+                    nums = [r[ai] for r in rows if ai is not None and r[ai] is not None]
+                    if func == "sum":
+                        vals.append(sum(nums) if nums else None)
+                    elif func == "avg":
+                        vals.append(sum(nums) / len(nums) if nums else None)
+                    elif func == "min":
+                        vals.append(min(nums) if nums else None)
+                    else:
+                        vals.append(max(nums) if nums else None)
+            out[tuple(vals)] += 1
+        return nschema, out
+    if op == "window":
+        schema, bag = _nrun(node["input"], tabs)
+        size = node["size"]
+        slide = node.get("slide", size)
+        tc = node["time_col"]
+        ti = schema.index((tc["table"], tc["column"]))
+        nschema = list(schema) + [("", "window_start"), ("", "window_end")]
+        out = Counter()
+        for tup in bag.elements():
+            t = tup[ti]
+            base = (t // slide) * slide
+            for k in range(size // slide):
+                s = base - k * slide
+                if s >= 0 and s <= t < s + size:
+                    out[tuple(tup) + (s, s + size)] += 1
+        return nschema, out
     raise AssertionError(f"naive ref: unsupported op {op}")
+
+
+def _nexpr_index(expr, schema):
+    """col 表达式在 schema 中的下标（naive 参考的聚合/窗口只按列聚合）。"""
+    assert expr["kind"] == "col", "naive 参考聚合参数只支持直接列引用"
+    return schema.index((expr["table"], expr["column"]))
 
 
 def naive_expected(plan, tables):
