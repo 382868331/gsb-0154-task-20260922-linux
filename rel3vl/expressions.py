@@ -13,7 +13,12 @@ kind        形态
 ``not``     ``{"kind": "not", "expr": E}``
 ``is_null`` ``{"kind": "is_null", "expr": E}``
 ``coalesce````{"kind": "coalesce", "args": [E, ...]}``
+``param``   ``{"kind": "param", "name": "p"}``（仅相关子计划内部使用）
 =========== =========================================================
+
+``param`` 不在用户计划文本中出现：相关 EXISTS/NOT EXISTS 节点的
+``correlations`` 绑定由编译器改写为参数表达式，参数值来自外层行，
+由执行上下文逐外层行提供。
 
 编译产物是 ``row -> value`` 的闭包；所有结构错误在编译期抛出
 （此时还没有任何行被处理），求值期只可能抛出类型语义错误。
@@ -37,6 +42,7 @@ _ALLOWED_KEYS = {
     "not": {"kind", "expr"},
     "is_null": {"kind", "expr"},
     "coalesce": {"kind", "args"},
+    "param": {"kind", "name"},
 }
 
 
@@ -63,12 +69,23 @@ def _validate_literal(value, where):
     )
 
 
-def compile_expr(raw, col_index, where, depth=0):
-    """把表达式字典编译为 ``row -> value``。
+def compile_expr(raw, col_index, where, depth=0, params=None):
+    """把表达式字典编译为 ``(row, frame) -> value``。
 
     ``col_index`` 为 ``(source_id, column_name) -> 列下标`` 的映射。
     ``where`` 是错误定位前缀（如 ``"[node#2/expr]"``）。
+
+    ``params`` 描述当前相关作用域可见的外层参数（相关 EXISTS 绑定）：
+
+    * ``params["cols"]``: ``{(inner_alias, inner_name): param_name}``，
+      子计划中对这些限定名的 ``col`` 引用改为从执行帧取值；
+    * ``params["names"]``: ``{param_name}``，供内部 ``param`` 表达式校验。
+
+    作用域是词法且显式的：不在 ``col_index`` 也不在 ``params`` 中的列
+    一律抛 :class:`SchemaError`，绝不静默当作 NULL。
     """
+    param_cols = params["cols"] if params else {}
+    param_names = params["names"] if params else set()
     if depth > MAX_EXPR_DEPTH:
         raise ExpressionError(f"{where}: 表达式嵌套超过 {MAX_EXPR_DEPTH} 层")
     if not isinstance(raw, dict):
@@ -86,7 +103,30 @@ def compile_expr(raw, col_index, where, depth=0):
 
     if kind == "lit":
         value = _validate_literal(raw["value"], where)
-        return lambda row: value
+        return lambda row, frame: value
+
+    if kind == "param":
+        pname = raw["name"]
+        if not isinstance(pname, str) or not pname:
+            raise ExpressionError(f"{where}: param.name 必须是非空字符串")
+        if pname not in param_names:
+            raise SchemaError(
+                f"{where}: 内部参数 {pname!r} 在当前相关作用域中不存在；"
+                f"可见参数：{sorted(param_names) or '<无>'}"
+            )
+
+        def eval_param(row, frame):
+            try:
+                return frame[pname]
+            except KeyError:
+                # 理论上编译期已保证名字合法、帧中必有此键；
+                # 守卫是为了把任何内部不一致也归为可定位的 QueryError，
+                # 而不是裸 KeyError。
+                raise SchemaError(
+                    f"{where}: 相关参数 {pname!r} 在执行帧中缺失"
+                ) from None
+
+        return eval_param
 
     if kind == "col":
         source, name = raw["table"], raw["column"]
@@ -94,41 +134,53 @@ def compile_expr(raw, col_index, where, depth=0):
             raise ExpressionError(f"{where}: col.table 必须是字符串（投影输出列默认 ''）")
         if not isinstance(name, str) or not name:
             raise ExpressionError(f"{where}: col.column 必须是非空字符串")
-        idx = col_index.get((source, name))
+        qname = (source, name)
+        if qname in param_cols:
+            if qname in col_index:
+                # 不允许相关绑定名遮蔽子计划自身的实际列，避免引用歧义。
+                raise SchemaError(
+                    f"{where}: 相关绑定 {source}.{name} 与子计划自身的实际列同名；"
+                    f"请在 correlations 中换一个 inner_alias/inner_name"
+                )
+            pname = param_cols[qname]
+            return lambda row, frame: frame[pname]
+        idx = col_index.get(qname)
         if idx is None:
             available = ", ".join(f"{s}.{c}" for s, c in col_index) or "<无列>"
+            declared = ", ".join(f"{s}.{c}" for s, c in param_cols) or "<无相关绑定>"
             raise SchemaError(
-                f"{where}: 未知列 {source}.{name}；当前可用列：{available}"
+                f"{where}: 未知列 {source}.{name}；当前可用列：{available}；"
+                f"本作用域已声明的相关绑定：{declared}"
             )
-        return lambda row: row[idx]
+        return lambda row, frame: row[idx]
 
     if kind in ("and", "or", "cmp"):
-        lf = compile_expr(raw["left"], col_index, where, depth + 1)
-        rf = compile_expr(raw["right"], col_index, where, depth + 1)
+        lf = compile_expr(raw["left"], col_index, where, depth + 1, params)
+        rf = compile_expr(raw["right"], col_index, where, depth + 1, params)
         if kind == "and":
-            return lambda row: _sql_and(lf(row), rf(row), where)
+            return lambda row, frame: _sql_and(lf(row, frame), rf(row, frame), where)
         if kind == "or":
-            return lambda row: _sql_or(lf(row), rf(row), where)
+            return lambda row, frame: _sql_or(lf(row, frame), rf(row, frame), where)
         op = raw["op"]
         if op not in CMP_OPS:
             raise ExpressionError(f"{where}: 未知比较符 {op!r}（允许 {CMP_OPS}）")
-        return lambda row: _compare(op, lf(row), rf(row), where)
+        return lambda row, frame: _compare(op, lf(row, frame), rf(row, frame), where)
 
     if kind in ("not", "is_null"):
-        inner = compile_expr(raw["expr"], col_index, where, depth + 1)
+        inner = compile_expr(raw["expr"], col_index, where, depth + 1, params)
         if kind == "not":
-            return lambda row: _sql_not(inner(row), where)
-        return lambda row: inner(row) is None
+            return lambda row, frame: _sql_not(inner(row, frame), where)
+        return lambda row, frame: inner(row, frame) is None
 
     # coalesce
     args = raw["args"]
     if not isinstance(args, list) or not args:
         raise ExpressionError(f"{where}: coalesce.args 必须是非空 list")
-    compiled = [compile_expr(a, col_index, where, depth + 1) for a in args]
+    compiled = [compile_expr(a, col_index, where, depth + 1, params) for a in args]
 
-    def eval_coalesce(row):
+    def eval_coalesce(row, frame):
         for f in compiled:
-            v = f(row)
+            v = f(row, frame)
             if v is not None:
                 return v
         return None

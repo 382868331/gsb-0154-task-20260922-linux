@@ -88,10 +88,32 @@ def rows_not_distinct(row_a, row_b) -> bool:
 _NULL_KEY = object()
 
 
+def value_key(v):
+    """单个标量的可哈希"不可区分"键（:func:`distinct_key` 的单值版本）。
+
+    除供整行去重外，也供相关 EXISTS 的相关键缓存使用：
+
+    * NULL 用模块级唯一哨兵 :data:`_NULL_KEY`，绝不与任何真实标量
+      （包括字符串 ``"None"``、数值 ``0`` 等）同键；
+    * bool 加 ``"b"`` 类型标签，避免 Python 中 ``1 == True`` 且
+      ``hash(1) == hash(True)`` 造成混组；
+    * int/float 共用 ``"n"`` 标签，``1`` 与 ``1.0`` 按数学值同键；
+    * str 使用独立的 ``"s"`` 标签与数值隔开。
+    """
+    if v is None:
+        return _NULL_KEY
+    if isinstance(v, bool):
+        return ("b", v)
+    if isinstance(v, (int, float)):
+        return ("n", v)
+    return ("s", v)
+
+
 def distinct_key(row):
     """整行的可哈希"不可区分"键。
 
-    与 :func:`not_distinct` 同语义，但 O(1) 可哈希，供 DISTINCT 使用：
+    与 :func:`not_distinct` 同语义，但 O(1) 可哈希，供 DISTINCT 与
+    相关 EXISTS 的相关键缓存使用：
 
     * NULL 共用唯一哨兵（NULL 与 NULL 同组）；
     * bool 加类型标签（防止 Python 中 ``1`` 与 ``True`` 哈希相等而混组）；
@@ -99,14 +121,4 @@ def distinct_key(row):
       （Python 中 ``hash(1) == hash(1.0)`` 且 ``1 == 1.0``）；
     * str 加类型标签与数值隔开。
     """
-    key = []
-    for v in row:
-        if v is None:
-            key.append(_NULL_KEY)
-        elif isinstance(v, bool):
-            key.append(("b", v))
-        elif isinstance(v, (int, float)):
-            key.append(("n", v))
-        else:
-            key.append(("s", v))
-    return tuple(key)
+    return tuple(value_key(v) for v in row)
