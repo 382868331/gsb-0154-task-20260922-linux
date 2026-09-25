@@ -121,6 +121,24 @@ def join_plan(outer=False, on=None):
     }
 
 
+def bind(from_source, from_column, as_source, as_column=None):
+    """一条相关绑定：外层 from_source.from_column -> 子计划内 as_source.as_column。"""
+    return {
+        "from": {"table": from_source, "column": from_column},
+        "as": as_source,
+        "column": as_column if as_column is not None else from_column,
+    }
+
+
+def exists_plan(input_node, subplan, correlate, negate=False):
+    return {
+        "op": "not_exists" if negate else "exists",
+        "input": input_node,
+        "subplan": subplan,
+        "correlate": correlate,
+    }
+
+
 def tables_fixture():
     return {"employees": employees_table(), "departments": departments_table()}
 
@@ -257,3 +275,97 @@ def naive_expected(plan, tables):
     tabs = _naive_tables(tables)
     schema, bag = _nrun(plan, tabs)
     return schema, Counter({tuple(k): v for k, v in bag.items()})
+
+
+# ---------------------------------------------------------------- 逐行朴素参考
+#
+# 与上面的袋参考不同：这里用 list 逐行推进、保序，专门交叉校验
+# exists / not_exists 的"外层重数与顺序保留、内层不复制外层行"语义。
+# 同样不导入被测核心；env 是 {(source, col): value} 的相关绑定字典。
+
+def _row_dict(schema, tup, env):
+    # 本地列优先（核心实现中绑定与本地同名已在编译期拒绝，此处不会冲突）
+    row = dict(env)
+    row.update(zip(schema, tup))
+    return row
+
+
+def _nrows(node, tabs, env):
+    op = node["op"]
+    if op == "scan":
+        cols, rows = tabs[node["table"]]
+        src = node.get("as", node["table"])
+        return [(src, c) for c in cols], [tuple(r) for r in rows]
+    if op == "filter":
+        schema, rows = _nrows(node["input"], tabs, env)
+        return schema, [
+            r for r in rows if _nev(node["expr"], _row_dict(schema, r, env)) is True
+        ]
+    if op == "project":
+        schema, rows = _nrows(node["input"], tabs, env)
+        nschema = [(c.get("table", ""), c["name"]) for c in node["columns"]]
+        out = []
+        for r in rows:
+            row = _row_dict(schema, r, env)
+            out.append(tuple(_nev(c["expr"], row) for c in node["columns"]))
+        return nschema, out
+    if op in ("inner_join", "left_join"):
+        ls, lrows = _nrows(node["left"], tabs, env)
+        rs, rrows = _nrows(node["right"], tabs, env)
+        schema = ls + rs
+        out = []
+        for lr in lrows:
+            matched = False
+            for rr in rrows:
+                joined = lr + rr
+                if _nev(node["on"], _row_dict(schema, joined, env)) is True:
+                    out.append(joined)
+                    matched = True
+            if op == "left_join" and not matched:
+                out.append(lr + (None,) * len(rs))
+        return schema, out
+    if op == "union_all":
+        ls, lrows = _nrows(node["left"], tabs, env)
+        _rs, rrows = _nrows(node["right"], tabs, env)
+        return ls, lrows + rrows
+    if op == "distinct":
+        schema, rows = _nrows(node["input"], tabs, env)
+        out, seen = [], set()
+        null_key = object()
+
+        def tag(v):
+            if v is None:
+                return null_key
+            if isinstance(v, bool):
+                return ("bool", v)
+            if isinstance(v, (int, float)):
+                return ("num", v)
+            return (type(v).__name__, v)
+
+        for r in rows:
+            key = tuple(tag(v) for v in r)
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+        return schema, out
+    if op in ("exists", "not_exists"):
+        schema, rows = _nrows(node["input"], tabs, env)
+        out = []
+        for r in rows:  # 逐外行：重数与顺序天然保留
+            base = _row_dict(schema, r, env)
+            sub_env = {
+                (b["as"], b["column"]): base[(b["from"]["table"], b["from"]["column"])]
+                for b in node["correlate"]
+            }
+            _s, sub_rows = _nrows(node["subplan"], tabs, sub_env)
+            hit = len(sub_rows) > 0  # 只看有没有行，不看行内容是否全 NULL
+            if hit != (op == "not_exists"):
+                out.append(r)  # 内层匹配再多也只保留这一份外层行
+        return schema, out
+    raise AssertionError(f"naive rows ref: unsupported op {op}")
+
+
+def naive_rows(plan, tables, env=None):
+    """逐行参考：返回 (schema, list[tuple])，保序、保重数，与核心实现无关。"""
+    tabs = _naive_tables(tables)
+    return _nrows(plan, tabs, dict(env or {}))

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from .engine import (
+    MAX_CORRELATION_DEPTH,
     MAX_NODES,
     MAX_ROWS_PER_TABLE,
     compile_plan,
@@ -31,4 +32,5 @@ __all__ = [
     "ExpressionError",
     "MAX_ROWS_PER_TABLE",
     "MAX_NODES",
+    "MAX_CORRELATION_DEPTH",
 ]

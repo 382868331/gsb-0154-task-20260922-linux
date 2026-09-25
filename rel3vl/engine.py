@@ -10,6 +10,25 @@
 * ``{"op": "left_join", "left": N, "right": N, "on": E}``
 * ``{"op": "union_all", "left": N, "right": N}``
 * ``{"op": "distinct", "input": N}``
+* ``{"op": "exists", "input": N, "subplan": M, "correlate": [B, ...]}``
+* ``{"op": "not_exists", ...}``（同上，语义取反）
+
+``exists`` / ``not_exists`` 是带显式相关列绑定的过滤节点：对外层每一行，
+把 ``correlate`` 声明的外层列值绑定进子计划后执行之；子计划**产生至少一行**
+（只看有没有行，不看行中字段是否为 NULL）则存在性为真。
+``exists`` 保留存在性为真的外层行，``not_exists`` 保留为假的外层行；
+外层行的重数与顺序原样保留，内层匹配再多也不会复制外层行。
+
+绑定形态::
+
+    {"from": {"table": "e", "column": "dept"}, "as": "o", "column": "dept"}
+
+含义：把当前外层行中 ``e.dept`` 的值，以限定名 ``o.dept`` 暴露给子计划。
+子计划只能引用自己的列与**已声明**的绑定列；引用未绑定的外层来源 id
+会在编译期抛 :class:`SchemaError`（先验证列作用域，不存在即错误，
+绝不当作 NULL）。绑定目标 ``(as, column)`` 不得重复，也不得与子计划
+表达式处的本地列同名（不允许遮蔽）。相关嵌套最多
+``MAX_CORRELATION_DEPTH`` 层；子计划节点计入 ``MAX_NODES`` 总上限。
 
 执行模型：
 
@@ -17,7 +36,9 @@
 * 全部节点先编译（表结构校验、模式推导、表达式编译、上限检查），
   编译期任何错误都在处理任何行之前抛出，因此不存在部分变更；
 * 列以 ``(source_id, name)`` 限定：scan 的来源 id 默认为表名，
-  自连接时用 ``"as"`` 指定不同来源 id。
+  自连接时用 ``"as"`` 指定不同来源 id；
+* 相关子计划在编译期把绑定列追加为"环境作用域"，求值时扩展行 =
+  本地行 + 绑定值，表达式列下标在编译期一次性确定。
 """
 
 from __future__ import annotations
@@ -28,6 +49,7 @@ from .values import distinct_key, validate_scalar
 
 MAX_ROWS_PER_TABLE = 200
 MAX_NODES = 10
+MAX_CORRELATION_DEPTH = 2
 
 _CHILD_KEYS = {
     "scan": (),
@@ -37,6 +59,8 @@ _CHILD_KEYS = {
     "left_join": ("left", "right"),
     "union_all": ("left", "right"),
     "distinct": ("input",),
+    "exists": ("input", "subplan"),
+    "not_exists": ("input", "subplan"),
 }
 _REQUIRED_KEYS = {
     "scan": ("table",),
@@ -46,6 +70,8 @@ _REQUIRED_KEYS = {
     "left_join": ("left", "right", "on"),
     "union_all": ("left", "right"),
     "distinct": ("input",),
+    "exists": ("input", "subplan", "correlate"),
+    "not_exists": ("input", "subplan", "correlate"),
 }
 _ALLOWED_NODE_KEYS = {
     "scan": {"op", "id", "table", "as"},
@@ -55,6 +81,8 @@ _ALLOWED_NODE_KEYS = {
     "left_join": {"op", "id", "left", "right", "on"},
     "union_all": {"op", "id", "left", "right"},
     "distinct": {"op", "id", "input"},
+    "exists": {"op", "id", "input", "subplan", "correlate"},
+    "not_exists": {"op", "id", "input", "subplan", "correlate"},
 }
 
 
@@ -121,7 +149,10 @@ class _Compiled:
     __slots__ = ("label", "schema", "run")
 
     def __init__(self, label, schema, run):
-        # schema: tuple[(source_id, column_name)]；run: () -> list[tuple]
+        # schema: tuple[(source_id, column_name)]（仅本地列，不含环境绑定）；
+        # run: (env: tuple = ()) -> list[tuple]
+        # env 是相关绑定值序列，与编译时的 env_scope 一一对应；
+        # 顶层计划 env 为空，直接 run() 即可。
         self.label = label
         self.schema = schema
         self.run = run
@@ -129,6 +160,21 @@ class _Compiled:
 
 def _col_index(schema):
     return {(s, c): i for i, (s, c) in enumerate(schema)}
+
+
+def _scope_index(local_schema, env_scope, where):
+    """表达式可见作用域：本地列在前、环境绑定列在后，下标与运行时
+    ``row + env`` 的扩展行布局一致。绑定列与本地列同名即拒绝（不许遮蔽）。"""
+    idx = _col_index(local_schema)
+    base = len(local_schema)
+    for j, (s, c) in enumerate(env_scope):
+        if (s, c) in idx:
+            raise SchemaError(
+                f"{where}: 相关绑定列 {s}.{c} 与本地列同名冲突；"
+                f"请给绑定改用其它 'as'/'column'"
+            )
+        idx[(s, c)] = base + j
+    return idx
 
 
 def compile_plan(plan, tables):
@@ -182,24 +228,46 @@ def compile_plan(plan, tables):
 
     compiled_by_num = {}
 
-    def build(node):
+    def build(node, env_scope, corr_depth):
+        # env_scope: tuple[(source_id, column_name)]，本子树可见的相关绑定列；
+        # corr_depth: 当前已处于多少层 exists/not_exists 子计划之内。
         num = seen_objs[id(node)]
         if num in compiled_by_num:
-            return compiled_by_num[num]
+            return num
         op = node["op"]
+
+        if op in ("exists", "not_exists"):
+            if corr_depth >= MAX_CORRELATION_DEPTH:
+                raise PlanError(
+                    f"[node#{num}]({op}): 相关嵌套超过 "
+                    f"{MAX_CORRELATION_DEPTH} 层上限"
+                )
+            child = compiled_by_num[build(node["input"], env_scope, corr_depth)]
+            bindings = _validate_correlate(node, num, child.schema, env_scope)
+            # 子计划只能看到声明的绑定列，不能越过该作用域取外层其它列。
+            sub_env = tuple((b["as"], b["column"]) for b in bindings)
+            sub = compiled_by_num[build(node["subplan"], sub_env, corr_depth + 1)]
+            comp = _compile_exists(
+                node, num, child, sub, bindings, env_scope, op == "not_exists"
+            )
+            compiled_by_num[num] = comp
+            return num
+
         child_nums = []
         for key in _CHILD_KEYS[op]:
-            child_nums.append(build(node[key]))
+            child_nums.append(build(node[key], env_scope, corr_depth))
         children = [compiled_by_num[n] for n in child_nums]
 
         if op == "scan":
             comp = _compile_scan(node, num, tables)
         elif op == "filter":
-            comp = _compile_filter(node, num, children[0])
+            comp = _compile_filter(node, num, children[0], env_scope)
         elif op == "project":
-            comp = _compile_project(node, num, children[0])
+            comp = _compile_project(node, num, children[0], env_scope)
         elif op in ("inner_join", "left_join"):
-            comp = _compile_join(node, num, children[0], children[1], op == "left_join")
+            comp = _compile_join(
+                node, num, children[0], children[1], op == "left_join", env_scope
+            )
         elif op == "union_all":
             comp = _compile_union(node, num, children[0], children[1])
         else:  # distinct
@@ -207,7 +275,7 @@ def compile_plan(plan, tables):
         compiled_by_num[num] = comp
         return num
 
-    build(plan)
+    build(plan, (), 0)
     return compiled_by_num[root_num]
 
 
@@ -226,20 +294,20 @@ def _compile_scan(node, num, tables):
     schema = tuple((source, c) for c in columns)
     snapshot = list(rows)  # 编译期快照：执行结果不受 tables 对象事后修改影响
 
-    def run():
+    def run(env=()):  # scan 无表达式，忽略环境绑定
         return [tuple(r) for r in snapshot]
 
     return _Compiled(f"[node#{num}](scan:{tname})", schema, run)
 
 
-def _compile_filter(node, num, child):
+def _compile_filter(node, num, child, env_scope):
     where = f"[node#{num}/expr](filter)"
-    pred = compile_expr(node["expr"], _col_index(child.schema), where)
+    pred = compile_expr(node["expr"], _scope_index(child.schema, env_scope, where), where)
 
-    def run():
+    def run(env=()):
         out = []
-        for row in child.run():
-            v = pred(row)
+        for row in child.run(env):
+            v = pred(row + env)
             # 三值逻辑：仅保留 TRUE；FALSE 与 UNKNOWN(NULL) 都丢弃。
             if v is True:
                 out.append(row)
@@ -248,12 +316,12 @@ def _compile_filter(node, num, child):
     return _Compiled(child.label + "|filter", child.schema, run)
 
 
-def _compile_project(node, num, child):
+def _compile_project(node, num, child, env_scope):
     cols = node.get("columns")
     if not isinstance(cols, list) or not cols:
         raise PlanError(f"[node#{num}](project): 'columns' 必须是非空 list")
     where = f"[node#{num}/expr](project)"
-    idx = _col_index(child.schema)
+    idx = _scope_index(child.schema, env_scope, where)
     compiled_cols = []
     out_schema = []
     seen = set()
@@ -280,16 +348,16 @@ def _compile_project(node, num, child):
         compiled_cols.append(f)
         out_schema.append(qname)
 
-    def run():
+    def run(env=()):
         out = []
-        for row in child.run():
-            out.append(tuple(f(row) for f in compiled_cols))
+        for row in child.run(env):
+            out.append(tuple(f(row + env) for f in compiled_cols))
         return out
 
     return _Compiled(child.label + "|project", tuple(out_schema), run)
 
 
-def _compile_join(node, num, left, right, outer):
+def _compile_join(node, num, left, right, outer, env_scope):
     where = f"[node#{num}/expr]({'left_join' if outer else 'inner_join'})"
     schema = tuple(left.schema) + tuple(right.schema)
     # source_id 必须能消除歧义：不同来源允许同名，但同 (source,name) 禁止。
@@ -298,21 +366,21 @@ def _compile_join(node, num, left, right, outer):
             f"[node#{num}]: 左右来源限定列完全相同 {sorted(set(left.schema) & set(right.schema))}；"
             f"请给其中一个 scan 设置不同的 'as'"
         )
-    pred = compile_expr(node["on"], _col_index(schema), where)
+    pred = compile_expr(node["on"], _scope_index(schema, env_scope, where), where)
     n_right = len(right.schema)
     nulls = (None,) * n_right
     tag = "left_join" if outer else "inner_join"
 
-    def run():
-        lr = left.run()
-        rr = right.run()
+    def run(env=()):
+        lr = left.run(env)
+        rr = right.run(env)
         out = []
         for lrow in lr:
             matched = False
             for rrow in rr:
                 joined = lrow + rrow
                 # 连接谓词与 filter 相同：仅 TRUE 匹配；FALSE/UNKNOWN 不匹配。
-                if pred(joined) is True:
+                if pred(joined + env) is True:
                     out.append(joined)
                     matched = True
             if outer and not matched:
@@ -333,8 +401,9 @@ def _compile_union(node, num, left, right):
     # UNION ALL 的输出模式取左侧（标准 SQL 同名规则），列数相同。
     schema = tuple(left.schema)
 
-    def run():
-        return list(left.run()) + list(right.run())  # 左袋全部行后接右袋全部行
+    def run(env=()):
+        # 左袋全部行后接右袋全部行
+        return list(left.run(env)) + list(right.run(env))
 
     return _Compiled(f"({left.label}) UNION ALL ({right.label})", schema, run)
 
@@ -342,10 +411,10 @@ def _compile_union(node, num, left, right):
 def _compile_distinct(node, num, child):
     schema = child.schema
 
-    def run():
+    def run(env=()):
         kept = []
         seen = set()
-        for row in child.run():
+        for row in child.run(env):
             # IS NOT DISTINCT FROM 语义：NULL 与 NULL 同组；哈希键 O(n) 判定，
             # 保留每个等价组的首次出现，顺序确定。
             key = distinct_key(row)
@@ -355,6 +424,89 @@ def _compile_distinct(node, num, child):
         return kept
 
     return _Compiled(child.label + "|distinct", schema, run)
+
+
+# ---------------------------------------------------------------- 相关存在性
+
+def _validate_correlate(node, num, input_schema, env_scope):
+    """校验 ``correlate`` 绑定列表，返回规范化绑定 dict 序列。
+
+    先验证列作用域：``from`` 必须能解析到"输入模式 + 本层环境"中真实存在
+    的列，不存在即 :class:`SchemaError`，绝不把不存在的列当 NULL。
+    """
+    where = f"[node#{num}]({node['op']})"
+    corr = node["correlate"]
+    if not isinstance(corr, list):
+        raise PlanError(f"{where}: 'correlate' 必须是 list")
+    visible = _scope_index(input_schema, env_scope, where)
+    bindings = []
+    seen_targets = set()
+    for i, b in enumerate(corr):
+        bw = f"{where}/correlate#{i}"
+        if not isinstance(b, dict):
+            raise PlanError(f"{bw}: 绑定必须是 dict，得到 {type(b).__name__}")
+        extra = set(b) - {"from", "as", "column"}
+        if extra:
+            raise PlanError(f"{bw}: 含未知字段 {sorted(extra)}")
+        for key in ("from", "as", "column"):
+            if key not in b:
+                raise PlanError(f"{bw}: 缺少必填字段 {key!r}")
+        frm = b["from"]
+        if not isinstance(frm, dict) or set(frm) != {"table", "column"}:
+            raise PlanError(f"{bw}: 'from' 必须是含 table/column 的 dict")
+        ft, fc = frm["table"], frm["column"]
+        if not isinstance(ft, str) or not isinstance(fc, str) or not fc:
+            raise PlanError(f"{bw}: from.table/from.column 必须是字符串且列名非空")
+        if (ft, fc) not in visible:
+            available = ", ".join(f"{s}.{c}" for s, c in visible) or "<无列>"
+            raise SchemaError(
+                f"{bw}: 绑定来源 {ft}.{fc} 不在可见作用域内（可用列：{available}）"
+            )
+        alias, name = b["as"], b["column"]
+        if not isinstance(alias, str) or not alias:
+            raise PlanError(f"{bw}: 'as' 必须是非空字符串")
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"{bw}: 'column' 必须是非空字符串")
+        if (alias, name) in seen_targets:
+            raise SchemaError(f"{bw}: 绑定目标 {alias}.{name} 重复")
+        seen_targets.add((alias, name))
+        bindings.append({"from": {"table": ft, "column": fc}, "as": alias, "column": name})
+    return bindings
+
+
+def _compile_exists(node, num, child, sub, bindings, env_scope, negate):
+    tag = "not_exists" if negate else "exists"
+    where = f"[node#{num}]({tag})"
+    idx = _scope_index(child.schema, env_scope, where)
+    # 绑定来源列在扩展行（本地行 + 本层环境）中的下标，编译期一次确定。
+    from_idx = tuple(idx[(b["from"]["table"], b["from"]["column"])] for b in bindings)
+
+    def run(env=()):
+        # memo 键只含绑定值经 distinct_key 规范化后的形式：
+        #   * NULL 映射为唯一哨兵（NULL 与 NULL 同键，且不与任何真值混淆）；
+        #   * bool/int/float/str 带类型标签，True 与 1 不混键，1 与 1.0 同键
+        #     （与比较语义一致：数值按数学值相等，存在性结果必然相同）；
+        #   * 来源 id 不进键 —— 绑定列表在编译期固定于本闭包，
+        #     同一 memo 内不存在"同值不同来源"的二义。
+        # memo 是 run 的局部变量：每次执行独立；若本次执行中途抛错，
+        # 整个 memo 随调用帧丢弃，不会污染下一次执行。
+        memo = {}
+        out = []
+        for row in child.run(env):
+            ext = row + env
+            bound = tuple(ext[i] for i in from_idx)
+            key = distinct_key(bound)
+            hit = memo.get(key)
+            if hit is None:
+                # 存在性只看子计划是否产生行，不看行中字段是否为 NULL。
+                hit = bool(sub.run(bound))
+                memo[key] = hit
+            if hit is not negate:
+                # 外层行按原重数与顺序保留；内层匹配数不影响输出重数。
+                out.append(row)
+        return out
+
+    return _Compiled(child.label + f"|{tag}", child.schema, run)
 
 
 # ---------------------------------------------------------------- 公开入口
