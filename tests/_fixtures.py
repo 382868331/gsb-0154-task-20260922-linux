@@ -257,3 +257,71 @@ def naive_expected(plan, tables):
     tabs = _naive_tables(tables)
     schema, bag = _nrun(plan, tabs)
     return schema, Counter({tuple(k): v for k, v in bag.items()})
+
+
+# ------------------------------------------------- grouping sets 朴素参考
+#
+# 与核心完全不同的独立实现：逐个分组集分别执行（每个分组集跑一遍独立的
+# 分组聚合），再按分组集顺序拼接。行 = dict，分组键 = 逐值标记元组。
+
+
+def _naive_tag(v, null_key):
+    if v is None:
+        return null_key
+    if isinstance(v, bool):
+        return ("bool", v)
+    if isinstance(v, (int, float)):
+        return ("num", v)
+    return (type(v).__name__, v)
+
+
+def naive_grouping_sets(child_plan, grouping_sets, aggregates, tables):
+    """朴素 grouping sets 参考：返回 list[tuple]（有序，含重复行）。
+
+    输出列布局与核心约定一致：分组列并集 + 聚合列 + grouping 位图。
+    """
+    schema, bag = _nrun(child_plan, _naive_tables(tables))
+    rows = [dict(zip(schema, t)) for t in bag.elements()]
+    union = []
+    for gset in grouping_sets:
+        for ref in gset:
+            q = (ref["table"], ref["column"])
+            if q not in union:
+                union.append(q)
+    out = []
+    for gset in grouping_sets:
+        members = [(ref["table"], ref["column"]) for ref in gset]
+        mask = 0
+        for q in members:
+            mask |= 1 << union.index(q)
+        if members:
+            null_key = object()
+            groups = {}
+            order = []
+            for row in rows:
+                key = tuple(_naive_tag(row[q], null_key) for q in members)
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(row)
+            buckets = [groups[k] for k in order]
+        else:
+            buckets = [list(rows)]  # 空分组集：全表一组，空表也有一行
+        for bucket in buckets:
+            vals = {q: (bucket[0][q] if bucket else None) for q in members}
+            rec = [vals.get(q) for q in union]
+            for agg in aggregates:
+                f = agg["func"]
+                if f == "count" and "expr" not in agg:
+                    rec.append(len(bucket))
+                    continue
+                expr = agg["expr"]
+                vs = [_nev(expr, r) for r in bucket]
+                if f == "count":
+                    rec.append(sum(1 for v in vs if v is not None))
+                else:  # sum
+                    nums = [v for v in vs if v is not None]
+                    rec.append(sum(nums) if nums else None)
+            rec.append(mask)
+            out.append(tuple(rec))
+    return out

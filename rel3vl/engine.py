@@ -10,6 +10,8 @@
 * ``{"op": "left_join", "left": N, "right": N, "on": E}``
 * ``{"op": "union_all", "left": N, "right": N}``
 * ``{"op": "distinct", "input": N}``
+* ``{"op": "aggregate", "input": N, "grouping_sets": [[{"table","column"}, ...], ...],
+     "aggregates": [{"name", "func": "count"|"sum", "expr"?}, ...]}``
 
 执行模型：
 
@@ -22,7 +24,7 @@
 
 from __future__ import annotations
 
-from .errors import PlanError, SchemaError, TableError
+from .errors import ExpressionError, PlanError, SchemaError, TableError
 from .expressions import compile_expr
 from .values import distinct_key, validate_scalar
 
@@ -37,6 +39,7 @@ _CHILD_KEYS = {
     "left_join": ("left", "right"),
     "union_all": ("left", "right"),
     "distinct": ("input",),
+    "aggregate": ("input",),
 }
 _REQUIRED_KEYS = {
     "scan": ("table",),
@@ -46,6 +49,7 @@ _REQUIRED_KEYS = {
     "left_join": ("left", "right", "on"),
     "union_all": ("left", "right"),
     "distinct": ("input",),
+    "aggregate": ("input", "grouping_sets", "aggregates"),
 }
 _ALLOWED_NODE_KEYS = {
     "scan": {"op", "id", "table", "as"},
@@ -55,7 +59,14 @@ _ALLOWED_NODE_KEYS = {
     "left_join": {"op", "id", "left", "right", "on"},
     "union_all": {"op", "id", "left", "right"},
     "distinct": {"op", "id", "input"},
+    "aggregate": {"op", "id", "input", "grouping_sets", "aggregates"},
 }
+
+AGGREGATE_FUNCS = ("count", "sum")
+# 位图输出列的保留限定名：("", "grouping")。bit i 置位表示分组列并集中
+# 第 i 列参与本行所属的分组集；未置位时该列输出的 NULL 是"汇总产生的空列"，
+# 与输入数据中的真实 NULL 相区分。
+GROUPING_COLUMN = ("", "grouping")
 
 
 # ---------------------------------------------------------------- 输入表校验
@@ -202,6 +213,8 @@ def compile_plan(plan, tables):
             comp = _compile_join(node, num, children[0], children[1], op == "left_join")
         elif op == "union_all":
             comp = _compile_union(node, num, children[0], children[1])
+        elif op == "aggregate":
+            comp = _compile_aggregate(node, num, children[0])
         else:  # distinct
             comp = _compile_distinct(node, num, children[0])
         compiled_by_num[num] = comp
@@ -355,6 +368,151 @@ def _compile_distinct(node, num, child):
         return kept
 
     return _Compiled(child.label + "|distinct", schema, run)
+
+
+def _compile_aggregate(node, num, child):
+    """grouping sets 聚合：count/sum + 显式分组列列表 + grouping 位图。
+
+    输出模式 = 分组列并集（按首次出现顺序）+ 各聚合输出列 + ("", "grouping")
+    位图列。位图 bit i 置位 <=> 并集第 i 列参与本行所属分组集。
+    输出顺序：分组集按给定顺序逐一执行；同一分组集内，组按键在输入袋中
+    的首次出现顺序输出；重复分组集各自产生自己的结果行（不去重）。
+    """
+    where = f"[node#{num}](aggregate)"
+    idx = _col_index(child.schema)
+
+    grouping_sets = node.get("grouping_sets")
+    if not isinstance(grouping_sets, list) or not grouping_sets:
+        raise PlanError(f"{where}: 'grouping_sets' 必须是非空 list")
+    parsed_sets = []   # list[tuple[(source, column), ...]]，集内列有序、无重复
+    union_cols = []    # 全部分组列的并集，按首次出现顺序
+    for si, gset in enumerate(grouping_sets):
+        if not isinstance(gset, list):
+            raise PlanError(f"{where} grouping_set#{si}: 必须是分组列 list")
+        seen = set()
+        cols = []
+        for ci, ref in enumerate(gset):
+            loc = f"{where} grouping_set#{si} column#{ci}"
+            if not isinstance(ref, dict) or set(ref) - {"table", "column"}:
+                raise PlanError(f"{loc}: 必须是只含 table/column 的 dict")
+            source, name = ref.get("table"), ref.get("column")
+            if not isinstance(source, str):
+                raise PlanError(f"{loc}: 'table' 必须是字符串")
+            if not isinstance(name, str) or not name:
+                raise PlanError(f"{loc}: 'column' 必须是非空字符串")
+            qname = (source, name)
+            if qname not in idx:
+                available = ", ".join(f"{s}.{c}" for s, c in child.schema) or "<无列>"
+                raise SchemaError(
+                    f"{loc}: 未知分组列 {source}.{name}；当前可用列：{available}"
+                )
+            if qname in seen:
+                raise PlanError(f"{loc}: 同一分组集内分组列重复：{source}.{name}")
+            seen.add(qname)
+            cols.append(qname)
+            if qname not in union_cols:
+                union_cols.append(qname)
+        parsed_sets.append(tuple(cols))
+
+    aggregates = node.get("aggregates")
+    if not isinstance(aggregates, list) or not aggregates:
+        raise PlanError(f"{where}: 'aggregates' 必须是非空 list")
+    agg_out_names = []
+    agg_funcs = []   # (func, expr_fn|None)
+    used_out = set(union_cols) | {GROUPING_COLUMN}
+    for ai, spec in enumerate(aggregates):
+        loc = f"{where} aggregate#{ai}"
+        if not isinstance(spec, dict) or set(spec) - {"name", "func", "expr"}:
+            raise PlanError(f"{loc}: 必须是只含 name/func/expr 的 dict")
+        name = spec.get("name")
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"{loc}: 'name' 必须是非空字符串")
+        qname = ("", name)
+        if qname in used_out:
+            raise SchemaError(
+                f"{loc}: 输出列名 {name!r} 与分组列/其他聚合/位图列冲突"
+            )
+        used_out.add(qname)
+        func = spec.get("func")
+        if func not in AGGREGATE_FUNCS:
+            raise PlanError(f"{loc}: 未知聚合函数 {func!r}（允许 {AGGREGATE_FUNCS}）")
+        expr_fn = None
+        if "expr" in spec:
+            expr_fn = compile_expr(
+                spec["expr"], idx, f"[node#{num}/expr](aggregate) column {name!r}"
+            )
+        elif func == "sum":
+            raise PlanError(f"{loc}: sum 必须给出 'expr'")
+        agg_out_names.append(qname)
+        agg_funcs.append((func, expr_fn))
+
+    union_index = [idx[q] for q in union_cols]
+    union_pos = {q: i for i, q in enumerate(union_cols)}
+    # 每个分组集：成员列在并集中的位置 + 位图
+    set_plans = []
+    for cols in parsed_sets:
+        positions = tuple(union_pos[q] for q in cols)
+        mask = 0
+        for p in positions:
+            mask |= 1 << p
+        set_plans.append((positions, mask))
+    schema = tuple(union_cols) + tuple(agg_out_names) + (GROUPING_COLUMN,)
+
+    def run():
+        rows = child.run()
+        out = []
+        for positions, mask in set_plans:
+            if positions:
+                # 非空分组集：按键（IS NOT DISTINCT FROM 语义，NULL 与 NULL 同组）
+                # 分组，组顺序 = 键在输入袋中的首次出现顺序；空输入 -> 零行。
+                groups = {}
+                order = []
+                for row in rows:
+                    key = distinct_key([row[union_index[p]] for p in positions])
+                    bucket = groups.get(key)
+                    if bucket is None:
+                        bucket = groups[key] = []
+                        order.append(key)
+                    bucket.append(row)
+                seq = (groups[k] for k in order)
+            else:
+                # 空分组集：全表一组；空输入仍有一行（count=0、sum=NULL）。
+                seq = (list(rows),)
+            for bucket in seq:
+                values = [None] * len(union_cols)
+                if bucket:
+                    first = bucket[0]
+                    for p in positions:
+                        values[p] = first[union_index[p]]
+                for (func, expr_fn), (q_src, q_name) in zip(agg_funcs, agg_out_names):
+                    values.append(_eval_aggregate(func, expr_fn, bucket, where))
+                values.append(mask)
+                out.append(tuple(values))
+        return out
+
+    return _Compiled(child.label + "|aggregate", schema, run)
+
+
+def _eval_aggregate(func, expr_fn, bucket, where):
+    """对一组行求 count/sum；NULL 处理沿用三值逻辑口径（NULL 被跳过）。"""
+    if func == "count":
+        if expr_fn is None:
+            return len(bucket)  # count(*)：袋中重复行全部计入
+        return sum(1 for row in bucket if expr_fn(row) is not None)
+    # sum：跳过 NULL；全 NULL（或空组）-> NULL
+    total = 0
+    seen = False
+    for row in bucket:
+        v = expr_fn(row)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ExpressionError(
+                f"{where}: sum 只接受 int/float（bool 不视作数值），得到 {v!r}"
+            )
+        total += v
+        seen = True
+    return total if seen else None
 
 
 # ---------------------------------------------------------------- 公开入口

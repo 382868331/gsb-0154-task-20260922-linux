@@ -7,6 +7,20 @@
 - 依赖：**无第三方依赖**；无需网络、账号、密钥、Docker 或外部服务
 - 测试：`python -m unittest discover -s tests -v`
 - 演示：`python demo.py`（实测约 0.02 秒，远小于 8 秒预算，现场计算、无 sleep、无预录）
+- 增量演示：`python demo_iteration.py`（grouping sets 专题，实测约 0.02 秒，
+  远小于 90 秒预算，现场计算、无 sleep、无预录）
+
+## 环境准备（隔离 venv）
+
+不需要任何第三方包，venv 仅用于隔离解释器：
+
+    python3.14 -m venv .venv
+    . .venv/bin/activate
+    python -m unittest discover -s tests -v
+    python demo_iteration.py
+
+仓库根目录的 `.venv` 符号链接即按此方式准备；直接用系统 `python3`（3.14.7）
+运行亦可，结果一致。
 
 ## 接口
 
@@ -52,6 +66,36 @@ tables = {
 | `left_join` | 同上 | 左行对**所有**右行都无 TRUE 匹配时，补一行右侧全 NULL |
 | `union_all` | `{"op":"union_all","left":N,"right":N}` | 袋拼接：先左后右；两边列名序列必须一致 |
 | `distinct` | `{"op":"distinct","input":N}` | 袋去重，保留每组首次出现，顺序确定 |
+| `aggregate` | `{"op":"aggregate","input":N,"grouping_sets":[[{"table":"e","column":"dept"}]],"aggregates":[{"name":"n","func":"count"}]}` | grouping sets 汇总，见下节 |
+
+### grouping sets 汇总（`aggregate` 节点）
+
+可放在 filter / project / join 等任意节点之后。字段：
+
+- `"grouping_sets"`：非空 list，每个元素是一个**显式分组列列表**
+  （列用 `{"table","column"}` 限定引用）。空 list `[]` 表示空分组集（全表一组）。
+  分组集按给定顺序逐一执行；**重复分组集不去重**，各自产生自己的结果行。
+- `"aggregates"`：非空 list，每项 `{"name","func","expr"?}`：
+  - `count` 无 `expr`：count(*)，袋中重复行全部计入；
+  - `count` 带 `expr`：统计该表达式非 NULL 的行数；
+  - `sum` 必须带 `expr`：跳过 NULL，全 NULL（或空组）结果为 NULL；
+    只接受 int/float（bool 不视作数值，命中即 `ExpressionError`）。
+
+输出模式 = **分组列并集**（按各分组集中首次出现的顺序）+ 各聚合输出列
+（来源 id 为 `""`）+ 末尾保留位图列 `("", "grouping")`。
+
+**grouping 位图**：`grouping` 列是整数位图，bit `i`（值 `1 << i`）置位当且仅当
+分组列并集中第 `i` 列参与本行所属的分组集。于是"汇总产生的空列"（bit 未置位、
+值为 NULL）与输入中真实的 NULL（bit 置位、值为 NULL）可明确区分。
+聚合输出列名不得与分组列、其他聚合或保留名 `grouping` 冲突。
+
+**空输入规则**：空输入配空分组集仍输出**一行**（count=0、sum=NULL）；
+非空分组集在空输入下没有任何组，返回**零行**。
+
+**NULL 与顺序**：分组键相等沿用 `IS NOT DISTINCT FROM`（同值 NULL 同组；
+`1` 与 `1.0` 同组；`True` 与 `1` 不同组）；聚合的 NULL 处理沿用三值逻辑口径
+（NULL 被跳过，不产生 UNKNOWN 传播到结果）。**输出顺序确定**：分组集按给定
+顺序，同一分组集内各组按键在输入袋中的首次出现顺序。
 
 ### 表达式（判别字段 `kind`）
 
@@ -96,8 +140,9 @@ tables = {
 6. **列的身份是 `(source_id, column_name)`**：不同来源允许同名列；
    同限定名冲突（典型：未加别名的自连接）在编译期拒绝。
 7. **数值口径**：比较与去重直接使用 Python 机器整数/双精度浮点语义
-   （int 为任意精度；float 为 IEEE-754 binary64）。**输入侧已拒绝 NaN/Infinity，
-   模块不产生任何新数值（无算术运算），故不存在结果舍入误差，也不设容差**；
+   （int 为任意精度；float 为 IEEE-754 binary64）。**输入侧已拒绝 NaN/Infinity；
+   除 sum 聚合外模块不产生任何新数值，sum 为 int/float 的直接累加
+   （int 精确、float 为 IEEE-754 累加），不设容差**；
    `1` 与 `1.0` 的相等按二进制 64 位双精度 `==` 判定，不使用任何 epsilon。
 
 ## 测试
@@ -112,7 +157,8 @@ distinct 的 NULL/类型语义、来源限定与自连接、上限、环检测�
 
 ## 已知限制（本契约子集，不宣称行业标准兼容）
 
-- 不是 SQL：不解析 SQL 文本，无聚合、排序、子查询、外键、类型系统、日期/二进制类型；
+- 不是 SQL：不解析 SQL 文本，无排序、子查询、外键、类型系统、日期/二进制类型；
+- 聚合仅支持 `count` / `sum` 与显式分组列列表（无 ROLLUP/CUBE 简写、无 HAVING、无 avg/min/max）；
 - 无算术/函数字段，比较符与逻辑算符即全部表达式能力；
 - union_all 只按列名序列一致校验，不做隐式类型协调；
 - join 为嵌套循环实现（受 200 行上限约束，规模极小，未做哈希/排序优化）；
@@ -130,4 +176,6 @@ rel3vl/engine.py        # execute(plan, tables) 与计划编译
 tests/test_engine.py    # 必要测试（38 个用例）
 tests/_fixtures.py      # 固定数据 + 独立朴素参考
 demo.py                 # 固定输入演示
+tests/test_grouping.py  # grouping sets 测试（29 个用例）
+demo_iteration.py       # grouping sets 增量演示
 ```
