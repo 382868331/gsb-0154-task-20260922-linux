@@ -9,7 +9,8 @@
 * ``{"op": "inner_join", "left": N, "right": N, "on": E}``
 * ``{"op": "left_join", "left": N, "right": N, "on": E}``
 * ``{"op": "union_all", "left": N, "right": N}``
-* ``{"op": "distinct", "input": N}``
+ * ``{"op": "distinct", "input": N}``
+ * ``{"op": "grouping_sets", "input": N, "group_by": [...], "sets": [...], "aggregates": [...]}``
 
 执行模型：
 
@@ -22,7 +23,7 @@
 
 from __future__ import annotations
 
-from .errors import PlanError, SchemaError, TableError
+from .errors import ExpressionError, PlanError, SchemaError, TableError
 from .expressions import compile_expr
 from .values import distinct_key, validate_scalar
 
@@ -37,6 +38,7 @@ _CHILD_KEYS = {
     "left_join": ("left", "right"),
     "union_all": ("left", "right"),
     "distinct": ("input",),
+    "grouping_sets": ("input",),
 }
 _REQUIRED_KEYS = {
     "scan": ("table",),
@@ -46,6 +48,7 @@ _REQUIRED_KEYS = {
     "left_join": ("left", "right", "on"),
     "union_all": ("left", "right"),
     "distinct": ("input",),
+    "grouping_sets": ("input", "group_by", "sets", "aggregates"),
 }
 _ALLOWED_NODE_KEYS = {
     "scan": {"op", "id", "table", "as"},
@@ -55,6 +58,7 @@ _ALLOWED_NODE_KEYS = {
     "left_join": {"op", "id", "left", "right", "on"},
     "union_all": {"op", "id", "left", "right"},
     "distinct": {"op", "id", "input"},
+    "grouping_sets": {"op", "id", "input", "group_by", "sets", "aggregates"},
 }
 
 
@@ -202,8 +206,10 @@ def compile_plan(plan, tables):
             comp = _compile_join(node, num, children[0], children[1], op == "left_join")
         elif op == "union_all":
             comp = _compile_union(node, num, children[0], children[1])
-        else:  # distinct
+        elif op == "distinct":
             comp = _compile_distinct(node, num, children[0])
+        else:  # grouping_sets
+            comp = _compile_grouping_sets(node, num, children[0])
         compiled_by_num[num] = comp
         return num
 
@@ -355,6 +361,151 @@ def _compile_distinct(node, num, child):
         return kept
 
     return _Compiled(child.label + "|distinct", schema, run)
+
+
+def _compile_grouping_sets(node, num, child):
+    """grouping sets 聚合节点：一次计划内按多个分组集分别汇总后按序拼接。
+
+    形态::
+
+        {"op": "grouping_sets", "input": N,
+         "group_by": [{"table": "e", "column": "dept"}, ...],   # 显式分组列全集（可空）
+         "sets": [["dept"], []],        # 每个分组集是 group_by 列名的子集，按序执行
+         "aggregates": [{"name": "n", "func": "count"},           # count 无 expr = 计行数
+                        {"name": "s", "func": "sum", "expr": E}]}  # sum 必须有 expr
+
+    输出模式 = group_by 列（保留来源 id） + ("", "grouping") + ("", 聚合名)……。
+    grouping 列为 "0"/"1" 位图字符串：对应 group_by 列参与本分组集为 "1"，
+    被汇总为占位 NULL 为 "0"——以此区分"汇总产生的空列"与输入中真正的 NULL。
+    """
+    where = f"[node#{num}](grouping_sets)"
+    idx = _col_index(child.schema)
+
+    group_by = node.get("group_by")
+    if not isinstance(group_by, list):
+        raise PlanError(f"{where}: 'group_by' 必须是 list（可为空 list）")
+    g_cols = []   # (source, name, 输入下标)
+    g_names = set()
+    for i, spec in enumerate(group_by):
+        if not isinstance(spec, dict) or set(spec) - {"table", "column"}:
+            raise PlanError(f"{where} group_by#{i}: 必须是只含 table/column 的 dict")
+        source = spec.get("table")
+        name = spec.get("column")
+        if not isinstance(source, str) or not isinstance(name, str) or not name:
+            raise PlanError(f"{where} group_by#{i}: table 必须是字符串，column 必须是非空字符串")
+        if (source, name) not in idx:
+            raise SchemaError(f"{where}: 未知分组列 {source}.{name}")
+        if name in g_names:
+            raise PlanError(f"{where}: 分组列名 {name!r} 重复（分组集按列名引用，必须唯一）")
+        g_names.add(name)
+        g_cols.append((source, name, idx[(source, name)]))
+
+    sets = node.get("sets")
+    if not isinstance(sets, list) or not sets:
+        raise PlanError(f"{where}: 'sets' 必须是非空 list（重复分组集不去重，各自产出）")
+    norm_sets = []
+    for i, s in enumerate(sets):
+        if not isinstance(s, list):
+            raise PlanError(f"{where} sets#{i}: 分组集必须是列名 list（空 list 表示总计）")
+        seen_in_set = set()
+        sel = []
+        for nm in s:
+            if not isinstance(nm, str) or nm not in g_names:
+                raise PlanError(f"{where} sets#{i}: {nm!r} 不是 group_by 中的列名")
+            if nm in seen_in_set:
+                raise PlanError(f"{where} sets#{i}: 列名 {nm!r} 在同一分组集内重复")
+            seen_in_set.add(nm)
+            sel.append(nm)
+        norm_sets.append(frozenset(sel))
+
+    aggs = node.get("aggregates")
+    if not isinstance(aggs, list) or not aggs:
+        raise PlanError(f"{where}: 'aggregates' 必须是非空 list")
+    compiled_aggs = []  # (name, func, expr_fn 或 None)
+    agg_names = set()
+    for i, spec in enumerate(aggs):
+        if not isinstance(spec, dict) or set(spec) - {"name", "func", "expr"}:
+            raise PlanError(f"{where} aggregates#{i}: 只允许字段 name/func/expr")
+        name = spec.get("name")
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"{where} aggregates#{i}: 'name' 必须是非空字符串")
+        if name in agg_names:
+            raise PlanError(f"{where}: 聚合输出列名 {name!r} 重复")
+        agg_names.add(name)
+        func = spec.get("func")
+        if func not in ("count", "sum"):
+            raise PlanError(f"{where} aggregates#{i}: func 必须是 'count'/'sum'，得到 {func!r}")
+        expr_fn = None
+        if "expr" in spec:
+            expr_fn = compile_expr(spec["expr"], idx, f"[node#{num}/expr](grouping_sets {name!r})")
+        elif func == "sum":
+            raise PlanError(f"{where} aggregates#{i}: sum 必须提供 'expr'")
+        compiled_aggs.append((name, func, expr_fn))
+
+    out_schema = tuple((s, n) for s, n, _ in g_cols) + (("", "grouping"),) \
+        + tuple(("", nm) for nm, _, _ in compiled_aggs)
+
+    def run():
+        rows = child.run()
+        out = []
+        for gset in norm_sets:
+            # 位图：参与本分组集的 group_by 列为 "1"，被汇总占位的为 "0"。
+            bitmap = "".join("1" if nm in gset else "0" for _, nm, _ in g_cols)
+            active = [(pos, cidx) for pos, (_, nm, cidx) in enumerate(g_cols) if nm in gset]
+            groups = {}   # 分组键 -> [代表行, 成员行 list]
+            order = []    # 首次出现顺序，保证确定性
+            for row in rows:
+                # 分组键用 distinct_key：NULL 与 NULL 同组（IS NOT DISTINCT FROM）。
+                key = distinct_key([row[cidx] for _, cidx in active])
+                bucket = groups.get(key)
+                if bucket is None:
+                    bucket = groups[key] = [row, []]
+                    order.append(key)
+                bucket[1].append(row)
+            if not active and not order:
+                # 空输入 + 空分组集：仍有一行（count=0、sum=NULL）。
+                order.append(None)
+                groups[None] = [None, []]
+            for key in order:
+                rep, members = groups[key]
+                vals = []
+                for pos, (source, nm, cidx) in enumerate(g_cols):
+                    if nm in gset:
+                        vals.append(rep[cidx])
+                    else:
+                        vals.append(None)  # 汇总占位 NULL，由 grouping 位图标出
+                vals.append(bitmap)
+                for agg_name, func, expr_fn in compiled_aggs:
+                    vals.append(_run_aggregate(func, expr_fn, members,
+                                               f"{where} 聚合 {agg_name!r}"))
+                out.append(tuple(vals))
+        return out
+
+    return _Compiled(child.label + "|grouping_sets", out_schema, run)
+
+
+def _run_aggregate(func, expr_fn, members, where):
+    """单个分组上求 count/sum；NULL 按 SQL 三值逻辑惯例跳过（不参与计数/求和）。"""
+    if func == "count":
+        if expr_fn is None:
+            return len(members)  # count(*)：计全部行，含全 NULL 行
+        n = 0
+        for row in members:
+            if expr_fn(row) is not None:
+                n += 1
+        return n
+    # sum：全部参数为 NULL（或空组）时结果为 NULL
+    total = None
+    for row in members:
+        v = expr_fn(row)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ExpressionError(
+                f"{where}: sum 只接受数值（int/float），得到 {type(v).__name__}={v!r}"
+            )
+        total = v if total is None else total + v
+    return total
 
 
 # ---------------------------------------------------------------- 公开入口

@@ -249,6 +249,47 @@ def _nrun(node, tabs):
                 seen.add(key)
                 out[tuple(tup)] = 1
         return schema, out
+    if op == "grouping_sets":
+        # 朴素参考：逐个分组集分别执行（dict 袋 + 首现顺序），再按序拼接，
+        # 重复分组集天然保留。与核心代码路径完全独立。
+        schema, bag = _nrun(node["input"], tabs)
+        gcols = [(g["table"], g["column"]) for g in node["group_by"]]
+        out = Counter()
+        for gset in node["sets"]:
+            gpos = [i for i, (_, c) in enumerate(gcols) if c in gset]
+            groups = {}
+            order = []
+            rows_in = []
+            for tup, mult in bag.items():
+                rows_in.extend([tup] * mult)
+            for tup in rows_in:
+                tup = tuple(tup)
+                key = tuple(tup[i] for i in gpos)  # None 自然同键
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(tup)
+            if not gpos and not order:  # 空输入 + 空分组集 -> 一行空组
+                order.append(())
+                groups[()] = []
+            bitmap = "".join("1" if c in gset else "0" for _, c in gcols)
+            for key in order:
+                members = groups[key]
+                prefix = [key[gpos.index(i)] if c in gset else None
+                          for i, (_, c) in enumerate(gcols)]
+                avals = []
+                for agg in node["aggregates"]:
+                    if agg["func"] == "count":
+                        if "expr" in agg:
+                            avals.append(sum(1 for r in members if _nev(agg["expr"], dict(zip(schema, r))) is not None))
+                        else:
+                            avals.append(len(members))
+                    else:  # sum：NULL 跳过，全 NULL/空组 -> NULL
+                        nums = [v for v in (_nev(agg["expr"], dict(zip(schema, r))) for r in members) if v is not None]
+                        avals.append(sum(nums) if nums else None)
+                out[tuple(prefix + [bitmap] + avals)] += 1
+        oschema = gcols + [("", "grouping")] + [("", a["name"]) for a in node["aggregates"]]
+        return oschema, out
     raise AssertionError(f"naive ref: unsupported op {op}")
 
 

@@ -6,7 +6,21 @@
 - Python：3.14.7（仅用标准库，3.10+ 语法亦可运行，开发与验收环境为 3.14.7）
 - 依赖：**无第三方依赖**；无需网络、账号、密钥、Docker 或外部服务
 - 测试：`python -m unittest discover -s tests -v`
-- 演示：`python demo.py`（实测约 0.02 秒，远小于 8 秒预算，现场计算、无 sleep、无预录）
+- 演示：`python demo.py`（基线能力，约 0.02 秒）；`python demo_iteration.py`（grouping sets 增量，
+  实测约 0.05 秒，远小于 90 秒预算，现场计算、无 sleep、无预录）
+
+## 环境准备（隔离 venv）
+
+不污染系统 Python，也不需要任何第三方包：
+
+```sh
+python3.14 -m venv .venv          # 任意可写目录均可；本仓库 .venv 是指向运行目录的符号链接
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python demo_iteration.py
+```
+
+适用范围：单机离线嵌入场景下的有限袋（每表 ≤ 200 行、计划 ≤ 10 节点）关系查询与
+count/sum 多级汇总；不是通用 SQL 引擎，不连接数据库服务。
 
 ## 接口
 
@@ -52,6 +66,36 @@ tables = {
 | `left_join` | 同上 | 左行对**所有**右行都无 TRUE 匹配时，补一行右侧全 NULL |
 | `union_all` | `{"op":"union_all","left":N,"right":N}` | 袋拼接：先左后右；两边列名序列必须一致 |
 | `distinct` | `{"op":"distinct","input":N}` | 袋去重，保留每组首次出现，顺序确定 |
+| `grouping_sets` | `{"op":"grouping_sets","input":N,"group_by":[...],"sets":[...],"aggregates":[...]}` | 一次计划内按多个分组集分别做 count/sum 汇总，结果按分组集顺序拼接 |
+
+### grouping_sets 节点（增量）
+
+```python
+{
+    "op": "grouping_sets",
+    "input": {"op": "scan", "table": "sales", "as": "s"},
+    "group_by": [{"table": "s", "column": "region"},
+                 {"table": "s", "column": "city"}],   # 显式分组列全集（可为空 list）
+    "sets": [["region", "city"], ["region"], []],      # 每个分组集是 group_by 列名子集
+    "aggregates": [
+        {"name": "n", "func": "count"},                          # 无 expr = count(*)
+        {"name": "amount_n", "func": "count", "expr": E},        # 计非 NULL 行数
+        {"name": "total", "func": "sum", "expr": E},             # sum 必须有 expr
+    ],
+}
+```
+
+- 输出模式 = `group_by` 列（保留来源 id） + `("", "grouping")` + 各聚合列（来源 id 为 `""`）。
+- **`grouping` 位图**：按 `group_by` 顺序的 `"0"/"1"` 字符串；`"1"` 表示该列参与本分组集，
+  `"0"` 表示该列在此行是被汇总出的占位 NULL。输入中真正的 NULL（位图对应位为 `"1"`）
+  与汇总产生的空列（位图为 `"0"`）由此区分。
+- **袋语义**：重复行全部参与聚合；重复分组集不去重，各自产出一份结果并按 `sets` 顺序拼接。
+- **分组键**：与 DISTINCT 相同的 `IS NOT DISTINCT FROM` 语义——同值 NULL 并入同一组。
+- **空输入**：空分组集 `[]` 仍输出一行（`count=0`、`sum=NULL`）；其他分组集没有组时返回零行。
+- **NULL 与三值逻辑**：聚合忽略 NULL 参数（`count(expr)` 不计、`sum` 不加）；全 NULL 或空组的
+  `sum` 结果为 NULL；`sum` 只接受 int/float（bool 拒绝），遇其他类型抛 `ExpressionError`。
+- **输出顺序**：分组集按 `sets` 给定顺序；同一分组集内各组按分组键在输入中的首次出现顺序。
+- 该节点是普通计划节点，`input` 可以是 filter/project/join 等任意节点的输出。
 
 ### 表达式（判别字段 `kind`）
 
@@ -91,6 +135,7 @@ tables = {
 4. **ON 与连接后 WHERE 不等价**：`LEFT JOIN ... ON c AND p` 中 `p` 失败的左行会补 NULL；
    把 `p` 放到连接后的 WHERE 则补 NULL 行也会被过滤。测试与 demo 均固化该差异。
 5. **DISTINCT 的相等是 `IS NOT DISTINCT FROM`**：两个 NULL 去重时视为相同
+   grouping_sets 的分组键沿用同一条规则（同值 NULL 同组、`1` 与 `1.0` 同组、bool 独立）；
    （区别于 `NULL = NULL` 为 UNKNOWN）；`1` 与 `1.0` 数学值相同视为同组；
    `True`/`False` 作为独立类型不与 `1`/`0` 合并。
 6. **列的身份是 `(source_id, column_name)`**：不同来源允许同名列；
@@ -112,7 +157,8 @@ distinct 的 NULL/类型语义、来源限定与自连接、上限、环检测�
 
 ## 已知限制（本契约子集，不宣称行业标准兼容）
 
-- 不是 SQL：不解析 SQL 文本，无聚合、排序、子查询、外键、类型系统、日期/二进制类型；
+- 不是 SQL：不解析 SQL 文本，无排序、子查询、外键、类型系统、日期/二进制类型；
+  聚合仅限 grouping_sets 节点的 count/sum，无 avg/min/max、HAVING、ROLLUP 语法糖；
 - 无算术/函数字段，比较符与逻辑算符即全部表达式能力；
 - union_all 只按列名序列一致校验，不做隐式类型协调；
 - join 为嵌套循环实现（受 200 行上限约束，规模极小，未做哈希/排序优化）；
@@ -128,6 +174,8 @@ rel3vl/values.py        # 标量校验、IS NOT DISTINCT FROM
 rel3vl/expressions.py   # 3VL 表达式编译/求值
 rel3vl/engine.py        # execute(plan, tables) 与计划编译
 tests/test_engine.py    # 必要测试（38 个用例）
+tests/test_grouping_sets.py  # grouping_sets 增量测试（12 个用例）
 tests/_fixtures.py      # 固定数据 + 独立朴素参考
 demo.py                 # 固定输入演示
+demo_iteration.py       # grouping_sets 增量演示
 ```
